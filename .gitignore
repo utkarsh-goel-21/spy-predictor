@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+*.env
+
+# Data (raw data is never committed)
+data/raw/
+data/processed/
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+
+# ML artifacts
+backend/models/*.pkl
+backend/models/*.joblib
+backend/models/*.pt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/settings.json
+.idea/
