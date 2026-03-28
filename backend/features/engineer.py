@@ -101,6 +101,15 @@ def save_processed(df: pd.DataFrame, filename: str = "spy_features.csv") -> Path
     print(f"Saved {len(df)} rows, {len(df.columns)} columns to {path}")
     return path
 
+def build_features_for_inference(df: pd.DataFrame, period: str = "5y") -> pd.DataFrame:
+    """Same as build_features but does NOT drop the last row — used for live prediction only."""
+    df = df.copy()
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    df = add_technical_indicators(df)
+    df = add_external_context(df, period=period)
+    df = df.dropna()
+    return df
+
 
 if __name__ == "__main__":
     from backend.data.fetch import fetch_spy_data
