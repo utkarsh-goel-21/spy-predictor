@@ -1,52 +1,81 @@
-import requests
-from datetime import datetime, timedelta
 import os
 import time
-from dotenv import load_dotenv
+from datetime import datetime, timedelta
 from pathlib import Path
 
+import requests
+from dotenv import load_dotenv
 
-def _fetch_for_date(date: datetime) -> dict:
-    """Fetch SPY sentiment for a single specific date."""
-    load_dotenv()
-    load_dotenv(Path(".env"))
-    load_dotenv(Path(__file__).resolve().parents[2] / ".env")
-    api_key = os.getenv("ALPHAVANTAGE_API_KEY")
+ROOT_DIR = Path(__file__).resolve().parents[2]
+ALPHAVANTAGE_URL = "https://www.alphavantage.co/query"
+NEWS_CACHE_TTL_SECONDS = 300
+NEWS_CACHE: dict[str, tuple[float, list[dict]]] = {}
 
-    time_from = date.strftime("%Y%m%dT0000")
-    next_day = date + timedelta(days=1)
-    time_to = next_day.strftime("%Y%m%dT0000")
 
+def load_alphavantage_api_key() -> str | None:
+    load_dotenv(ROOT_DIR / ".env")
+    return os.getenv("ALPHAVANTAGE_API_KEY")
+
+
+def fetch_recent_spy_feed(limit: int = 50, days_back: int = 7) -> list[dict] | None:
+    api_key = load_alphavantage_api_key()
+    if not api_key:
+        return None
+
+    cache_key = f"spy_feed_{limit}_{days_back}"
+    cached = NEWS_CACHE.get(cache_key)
+    if cached and time.time() - cached[0] < NEWS_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    time_from = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y%m%dT0000")
     params = {
         "function": "NEWS_SENTIMENT",
         "tickers": "SPY",
         "time_from": time_from,
-        "time_to": time_to,
-        "limit": 50,
+        "limit": limit,
         "apikey": api_key,
     }
 
-    response = requests.get("https://www.alphavantage.co/query", params=params)
+    response = requests.get(ALPHAVANTAGE_URL, params=params, timeout=30)
+    response.raise_for_status()
     data = response.json()
 
-    # Handle API errors
-    if "Error Message" in data or "Information" in data:
+    if "Error Message" in data or "Information" in data or "Note" in data:
         return None
 
     feed = data.get("feed", [])
-    if not feed:
-        return None
+    NEWS_CACHE[cache_key] = (time.time(), feed)
+    return feed
 
+
+def score_feed_for_date(feed: list[dict], date: datetime) -> dict | None:
+    target_date = date.date()
+    day_feed = []
     total_weight = 0.0
     weighted_score = 0.0
 
     for article in feed:
-        for ticker_data in article.get("ticker_sentiment", []):
-            if ticker_data["ticker"] == "SPY":
-                relevance = float(ticker_data["relevance_score"])
-                score = float(ticker_data["ticker_sentiment_score"])
-                weighted_score += score * relevance
-                total_weight += relevance
+        published = article.get("time_published", "")
+        try:
+            published_dt = datetime.strptime(published, "%Y%m%dT%H%M%S")
+        except ValueError:
+            continue
+
+        if published_dt.date() != target_date:
+            continue
+
+        spy_sentiment = next(
+            (ticker_data for ticker_data in article.get("ticker_sentiment", []) if ticker_data["ticker"] == "SPY"),
+            None,
+        )
+        if not spy_sentiment:
+            continue
+
+        relevance = float(spy_sentiment["relevance_score"])
+        score = float(spy_sentiment["ticker_sentiment_score"])
+        weighted_score += score * relevance
+        total_weight += relevance
+        day_feed.append(article)
 
     if total_weight == 0:
         return None
@@ -67,10 +96,18 @@ def _fetch_for_date(date: datetime) -> dict:
     return {
         "sentiment_score": round(final_score, 4),
         "sentiment_label": label,
-        "article_count": len(feed),
+        "article_count": len(day_feed),
         "sentiment_date": date.strftime("%Y-%m-%d"),
         "available": True,
     }
+
+
+def _fetch_for_date(date: datetime) -> dict:
+    """Fetch SPY sentiment for a single specific date from a cached recent feed."""
+    feed = fetch_recent_spy_feed(limit=50, days_back=7)
+    if not feed:
+        return None
+    return score_feed_for_date(feed, date)
 
 
 def fetch_spy_sentiment(last_close_date: datetime) -> dict:
@@ -82,16 +119,12 @@ def fetch_spy_sentiment(last_close_date: datetime) -> dict:
         hour=0, minute=0, second=0, microsecond=0
     )
 
-    # Step 1: Try last close date
     result = _fetch_for_date(last_close_normalized)
     if result:
         result["sentiment_source"] = "last_close"
         return result
 
-    # Step 2: Fall back to previous trading day
-    time.sleep(1)
     prev_day = last_close_normalized - timedelta(days=1)
-    # Skip weekends
     while prev_day.weekday() >= 5:
         prev_day -= timedelta(days=1)
 
@@ -100,7 +133,6 @@ def fetch_spy_sentiment(last_close_date: datetime) -> dict:
         result["sentiment_source"] = "previous_day"
         return result
 
-    # Step 3: Nothing available
     return {
         "sentiment_score": 0.0,
         "sentiment_label": "Neutral",

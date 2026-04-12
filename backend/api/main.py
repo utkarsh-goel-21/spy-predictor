@@ -1,14 +1,21 @@
+from datetime import datetime, time
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import joblib
+import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+
 from backend.api.predict import predict_next_day
-from backend.features.engineer import build_features, build_features_for_inference
 from backend.data.fetch import fetch_spy_data
 from backend.data.sentiment import fetch_spy_sentiment
-from datetime import datetime
-import joblib
-from pathlib import Path
+from backend.features.engineer import build_features, build_features_for_inference
 
 MODELS_DIR = Path(__file__).resolve().parents[1] / "models"
+PROCESSED_DATA_PATH = Path(__file__).resolve().parents[2] / "data" / "processed" / "spy_features.csv"
+MARKET_TZ = ZoneInfo("America/New_York")
+MARKET_CLOSE = time(hour=16, minute=0)
 
 app = FastAPI(title="SPY Direction Predictor API")
 
@@ -20,6 +27,37 @@ app.add_middleware(
 )
 
 
+def keep_completed_daily_bars(raw: pd.DataFrame) -> pd.DataFrame:
+    """Drop today's partial daily bar before the US market close."""
+    if raw.empty or len(raw) == 1:
+        return raw
+
+    last_date = pd.Timestamp(raw.index[-1]).tz_localize(None)
+    now_market = datetime.now(MARKET_TZ)
+
+    if last_date.date() == now_market.date() and now_market.time() < MARKET_CLOSE:
+        return raw.iloc[:-1]
+
+    return raw
+
+
+def next_trading_day_for(last_date: pd.Timestamp) -> pd.Timestamp:
+    return pd.Timestamp(last_date) + pd.offsets.BDay(1)
+
+
+def expected_latest_completed_bar_date(now_market: datetime | None = None) -> pd.Timestamp:
+    now_market = now_market or datetime.now(MARKET_TZ)
+    market_day = pd.Timestamp(now_market.date())
+    if now_market.time() >= MARKET_CLOSE:
+        return market_day
+    return market_day - pd.offsets.BDay(1)
+
+
+def load_training_dates() -> pd.DatetimeIndex:
+    df = pd.read_csv(PROCESSED_DATA_PATH, usecols=["Date"], parse_dates=["Date"])
+    return pd.DatetimeIndex(df["Date"]).tz_localize(None)
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -28,15 +66,46 @@ def health():
 @app.get("/predict")
 def predict():
     try:
-        import pandas as pd
-        raw = fetch_spy_data(period="1y")
+        raw = fetch_spy_data(period="1y", source_preference="latest")
+        raw = keep_completed_daily_bars(raw)
         df = build_features_for_inference(raw, period="1y")
         result = predict_next_day(df)
+        latest_missing_external = df.attrs.get("latest_missing_external", [])
 
+        # Use the last available data point as reference
+        raw_last_date = pd.Timestamp(raw.index[-1]).tz_localize(None)
         last_date = pd.Timestamp(df.index[-1])
-        next_trading_day = last_date + pd.offsets.BDay(1)
+        next_trading_day = next_trading_day_for(last_date)
+        expected_last_date = expected_latest_completed_bar_date()
+
+        result["market_data_source"] = raw.attrs.get("source", "unknown")
+        result["market_data_last_refreshed"] = raw.attrs.get("last_refreshed")
+        result["raw_data_last_date"] = str(raw_last_date.date())
         result["as_of_date"] = str(last_date.date())
         result["predicting_for"] = str(next_trading_day.date())
+        result["expected_latest_bar_date"] = str(expected_last_date.date())
+
+        if last_date < raw_last_date:
+            result["market_data_status"] = "feature_lag"
+            result["market_data_warning"] = (
+                f"SPY data is available through {raw_last_date.date()}, but one or more external features "
+                f"are only available through {last_date.date()}."
+            )
+        elif latest_missing_external:
+            result["market_data_status"] = "feature_lag_filled"
+            result["market_data_warning"] = (
+                f"SPY data is available through {raw_last_date.date()}, but "
+                f"{', '.join(latest_missing_external)} were carried forward from the last available day."
+            )
+        elif raw_last_date < expected_last_date:
+            result["market_data_status"] = "source_lag"
+            result["market_data_warning"] = (
+                f"{result['market_data_source']} daily data is currently available only through {raw_last_date.date()}, "
+                f"so the latest prediction is for {next_trading_day.date()}."
+            )
+        else:
+            result["market_data_status"] = "current"
+            result["market_data_warning"] = None
 
         sentiment = fetch_spy_sentiment(last_date.to_pydatetime().replace(tzinfo=None))
         result["sentiment"] = sentiment
@@ -69,10 +138,10 @@ def model_info():
         config = joblib.load(MODELS_DIR / "lstm_config.pkl")
         return {
             "model": "LSTM",
-            "sequence_length": 10,
+            "sequence_length": config.get("sequence_length", 10),
             "features": feature_cols,
             "num_features": config["input_size"],
-            "cv_accuracy": 0.5209,
+            "cv_accuracy": config.get("cv_accuracy", 0.5209),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -82,14 +151,18 @@ def model_info():
 def chart_data():
     try:
         import pandas as pd
-        raw = fetch_spy_data(period="3mo")
+        raw = fetch_spy_data(period="3mo", source_preference="latest")
         df = raw[["Close"]].copy()
         df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
         records = [
             {"date": str(idx.date()), "close": round(float(row["Close"]), 2)}
             for idx, row in df.iterrows()
         ]
-        return {"data": records}
+        return {
+            "data": records,
+            "source": raw.attrs.get("source", "unknown"),
+            "last_refreshed": raw.attrs.get("last_refreshed"),
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -97,27 +170,9 @@ def chart_data():
 @app.get("/news")
 def news():
     try:
-        from backend.data.sentiment import _fetch_for_date, load_dotenv, Path, os
-        load_dotenv()
-        load_dotenv(Path(".env"))
-        import requests as req
-        from datetime import datetime, timedelta
-        import os
+        from backend.data.sentiment import fetch_recent_spy_feed
 
-        api_key = os.getenv("ALPHAVANTAGE_API_KEY")
-        date = datetime.now() - timedelta(days=3)
-        time_from = date.strftime("%Y%m%dT0000")
-
-        params = {
-            "function": "NEWS_SENTIMENT",
-            "tickers": "SPY",
-            "time_from": time_from,
-            "limit": 10,
-            "apikey": api_key,
-        }
-        response = req.get("https://www.alphavantage.co/query", params=params)
-        data = response.json()
-        feed = data.get("feed", [])
+        feed = fetch_recent_spy_feed(limit=10, days_back=7) or []
 
         articles = []
         for article in feed:
@@ -150,7 +205,6 @@ def backtest(start_date: str, end_date: str):
         end_date:   YYYY-MM-DD — last day to predict for (must be in the past)
     """
     try:
-        import pandas as pd
         from datetime import timedelta
 
         # ── 1. Parse and validate dates ──────────────────────────────
@@ -198,6 +252,10 @@ def backtest(start_date: str, end_date: str):
         from backend.models.lstm_train import SEQUENCE_LENGTH, DEVICE
 
         model, scaler, feature_cols = load_model()
+        training_dates = load_training_dates()
+        training_date_set = {d.date() for d in training_dates}
+        training_start = pd.Timestamp(training_dates.min())
+        training_end = pd.Timestamp(training_dates.max())
 
         results = []
 
@@ -238,6 +296,7 @@ def backtest(start_date: str, end_date: str):
                 "predicted_direction": predicted_direction,
                 "actual_direction":    actual_direction,
                 "correct":             correct,
+                "in_sample":           date.date() in training_date_set,
                 "confidence":          confidence,
                 "prob_up":             prob_up,
                 "prob_down":           prob_down,
@@ -256,9 +315,19 @@ def backtest(start_date: str, end_date: str):
 
         up_preds   = [r for r in results if r["predicted_direction"] == "UP"]
         down_preds = [r for r in results if r["predicted_direction"] == "DOWN"]
+        in_sample_results = [r for r in results if r["in_sample"]]
+        out_sample_results = [r for r in results if not r["in_sample"]]
 
         up_accuracy   = round(sum(r["correct"] for r in up_preds)   / len(up_preds),   4) if up_preds   else None
         down_accuracy = round(sum(r["correct"] for r in down_preds) / len(down_preds), 4) if down_preds else None
+        in_sample_accuracy = (
+            round(sum(r["correct"] for r in in_sample_results) / len(in_sample_results), 4)
+            if in_sample_results else None
+        )
+        out_sample_accuracy = (
+            round(sum(r["correct"] for r in out_sample_results) / len(out_sample_results), 4)
+            if out_sample_results else None
+        )
 
         summary = {
             "total":                  total,
@@ -271,6 +340,13 @@ def backtest(start_date: str, end_date: str):
             "down_predictions":       len(down_preds),
             "up_accuracy":            up_accuracy,
             "down_accuracy":          down_accuracy,
+            "range_overlaps_training": bool(in_sample_results),
+            "training_start_date":     str(training_start.date()),
+            "training_end_date":       str(training_end.date()),
+            "in_sample_count":         len(in_sample_results),
+            "out_of_sample_count":     len(out_sample_results),
+            "in_sample_accuracy":      in_sample_accuracy,
+            "out_of_sample_accuracy":  out_sample_accuracy,
         }
 
         return {

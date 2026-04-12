@@ -6,6 +6,13 @@ from pathlib import Path
 
 PROCESSED_DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "processed"
 PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+EXTERNAL_CONTEXT_COLS = [
+    "dax_return",
+    "ftse_return",
+    "nikkei_return",
+    "vix_close",
+    "vix_change",
+]
 
 
 def fetch_external(ticker: str, period: str = "5y", name: str = "") -> pd.Series:
@@ -107,7 +114,16 @@ def build_features_for_inference(df: pd.DataFrame, period: str = "5y") -> pd.Dat
     df.index = pd.to_datetime(df.index).tz_localize(None)
     df = add_technical_indicators(df)
     df = add_external_context(df, period=period)
+    latest_missing_external = []
+    if not df.empty:
+        latest_row = df.iloc[-1]
+        latest_missing_external = [
+            col for col in EXTERNAL_CONTEXT_COLS
+            if col in df.columns and pd.isna(latest_row[col])
+        ]
+        df[EXTERNAL_CONTEXT_COLS] = df[EXTERNAL_CONTEXT_COLS].ffill()
     df = df.dropna()
+    df.attrs["latest_missing_external"] = latest_missing_external
     return df
 
 

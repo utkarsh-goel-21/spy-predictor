@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 import plotly.graph_objects as go
+import pandas as pd
 from datetime import datetime
 
 API_URL = "http://localhost:8000"
@@ -480,43 +481,39 @@ if bt_run:
         </div>
         """, unsafe_allow_html=True)
 
+    if s.get("range_overlaps_training"):
+        in_sample_acc = s["in_sample_accuracy"] * 100 if s["in_sample_accuracy"] is not None else None
+        out_sample_acc = s["out_of_sample_accuracy"] * 100 if s["out_of_sample_accuracy"] is not None else None
+        out_sample_text = f"{out_sample_acc:.1f}%" if out_sample_acc is not None else "—"
+        st.markdown(f"""
+        <div class="card" style="margin-top:1rem; border-color:rgba(250,204,21,0.2); background:rgba(250,204,21,0.06);">
+            <div class="section-label" style="color:#facc15;">Backtest Warning</div>
+            <div style="font-size:0.92rem; line-height:1.6; color:#d4d4d4;">
+                This range overlaps the training set through <span style="font-family:'IBM Plex Mono',monospace;">{s['training_end_date']}</span>.
+                In-sample accuracy is <span style="color:#facc15;">{in_sample_acc:.1f}%</span> on {s['in_sample_count']} days,
+                while unseen accuracy is <span style="color:#facc15;">{out_sample_text}</span> on {s['out_of_sample_count']} days.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
     # ── Results table ──────────────────────────────────────────────
     st.markdown("<div style='margin-top:2rem;'>", unsafe_allow_html=True)
-
-    rows_html = ""
+    table_rows = []
     for r in results:
-        correct_class = "bt-correct" if r["correct"] else "bt-wrong"
-        verdict = "✓" if r["correct"] else "✗"
-        pred_color = "#4ade80" if r["predicted_direction"] == "UP" else "#f87171"
-        actual_color = "#4ade80" if r["actual_direction"] == "UP" else "#f87171"
-        rows_html += f"""
-        <tr>
-            <td>{r['date']}</td>
-            <td style="color:{pred_color};">{r['predicted_direction']}</td>
-            <td style="color:{actual_color};">{r['actual_direction']}</td>
-            <td class="{correct_class}">{verdict}</td>
-            <td>{r['confidence']*100:.1f}%</td>
-        </tr>
-        """
+        table_rows.append({
+            "Date": r["date"],
+            "Predicted": r["predicted_direction"],
+            "Actual": r["actual_direction"],
+            "Result": "✓" if r["correct"] else "✗",
+            "Confidence": f"{r['confidence']*100:.1f}%",
+            "Seen In Training": "Yes" if r.get("in_sample") else "No",
+        })
 
-    st.markdown(f"""
-    <div class="card" style="overflow-x:auto;">
-        <table class="bt-table">
-            <thead>
-                <tr>
-                    <th>Date</th>
-                    <th>Predicted</th>
-                    <th>Actual</th>
-                    <th>Result</th>
-                    <th>Confidence</th>
-                </tr>
-            </thead>
-            <tbody>
-                {rows_html}
-            </tbody>
-        </table>
-    </div>
-    """, unsafe_allow_html=True)
+    st.dataframe(
+        pd.DataFrame(table_rows),
+        hide_index=True,
+        width="stretch",
+    )
 
     st.markdown("</div>", unsafe_allow_html=True)
     st.markdown("<hr class='row-divider'>", unsafe_allow_html=True)
@@ -537,6 +534,19 @@ if run:
     sentiment = pred["sentiment"]
     signal = pred["combined_signal"]
     score = sentiment["sentiment_score"]
+
+    if pred.get("market_data_warning"):
+        st.markdown(f"""
+        <div class="card" style="margin-bottom:1.25rem; border-color:rgba(250,204,21,0.2); background:rgba(250,204,21,0.06);">
+            <div class="section-label" style="color:#facc15;">Market Data Status</div>
+            <div style="font-size:0.92rem; line-height:1.6; color:#d4d4d4;">
+                {pred['market_data_warning']}
+                <div style="margin-top:0.6rem; font-family:'IBM Plex Mono',monospace; font-size:0.78rem; color:#a1a1aa;">
+                    Raw SPY bar: {pred.get('raw_data_last_date', '—')} · Feature row used: {pred['as_of_date']} · Expected latest bar: {pred.get('expected_latest_bar_date', '—')}
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
     # ── Row 1: Core metrics ──────────────────────────────
     st.markdown("<div class='section-label'>Prediction</div>", unsafe_allow_html=True)

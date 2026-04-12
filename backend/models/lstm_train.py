@@ -25,11 +25,13 @@ class SPYDataset(Dataset):
         self.seq_len = seq_len
 
     def __len__(self):
-        return len(self.X) - self.seq_len
+        return max(0, len(self.X) - self.seq_len + 1)
 
     def __getitem__(self, idx):
-        x_seq = self.X[idx: idx + self.seq_len]
-        y_label = self.y[idx + self.seq_len]
+        end_idx = idx + self.seq_len
+        x_seq = self.X[idx:end_idx]
+        # Align each sequence with the direction immediately after its last row.
+        y_label = self.y[end_idx - 1]
         return x_seq, y_label
 
 
@@ -171,7 +173,8 @@ def train_model(df: pd.DataFrame):
         fold_scores.append(score)
         print(f"Fold {fold + 1} accuracy: {score:.4f}")
 
-    print(f"\nMean CV accuracy: {np.mean(fold_scores):.4f}")
+    mean_cv_accuracy = float(np.mean(fold_scores))
+    print(f"\nMean CV accuracy: {mean_cv_accuracy:.4f}")
     print(f"Std: {np.std(fold_scores):.4f}")
 
     # Final model on all data — no early stopping needed, train for fixed epochs
@@ -192,18 +195,25 @@ def train_model(df: pd.DataFrame):
     print(f"\nFull training set report:")
     print(classification_report(labels, preds))
 
-    return final_model, final_scaler, feature_cols
+    return final_model, final_scaler, feature_cols, mean_cv_accuracy
 
 
-def save_artifacts(model, scaler, feature_cols):
+def save_artifacts(model, scaler, feature_cols, cv_accuracy: float):
     torch.save(model.state_dict(), MODELS_DIR / "lstm_model.pt")
     joblib.dump(scaler, MODELS_DIR / "lstm_scaler.pkl")
     joblib.dump(feature_cols, MODELS_DIR / "lstm_feature_cols.pkl")
-    joblib.dump({"input_size": len(feature_cols)}, MODELS_DIR / "lstm_config.pkl")
+    joblib.dump(
+        {
+            "input_size": len(feature_cols),
+            "sequence_length": SEQUENCE_LENGTH,
+            "cv_accuracy": round(cv_accuracy, 4),
+        },
+        MODELS_DIR / "lstm_config.pkl",
+    )
     print("Saved LSTM model, scaler, and config.")
 
 
 if __name__ == "__main__":
     df = load_features()
-    model, scaler, feature_cols = train_model(df)
-    save_artifacts(model, scaler, feature_cols)
+    model, scaler, feature_cols, cv_accuracy = train_model(df)
+    save_artifacts(model, scaler, feature_cols, cv_accuracy)
