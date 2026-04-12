@@ -15,6 +15,8 @@ build/
 # Data (raw data is never committed)
 data/raw/
 data/processed/
+!data/processed/
+!data/processed/spy_features.csv
 
 # Notebooks checkpoints
 .ipynb_checkpoints/
@@ -23,6 +25,10 @@ data/processed/
 backend/models/*.pkl
 backend/models/*.joblib
 backend/models/*.pt
+!backend/models/lstm_config.pkl
+!backend/models/lstm_feature_cols.pkl
+!backend/models/lstm_scaler.pkl
+!backend/models/lstm_model.pt
 
 # OS
 .DS_Store

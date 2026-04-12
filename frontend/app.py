@@ -1,10 +1,12 @@
+import os
+
 import streamlit as st
 import requests
 import plotly.graph_objects as go
 import pandas as pd
 from datetime import datetime
 
-API_URL = "http://localhost:8000"
+API_URL = os.getenv("API_URL", "http://localhost:8000").rstrip("/")
 
 st.set_page_config(
     page_title="SPY · Predictor",
