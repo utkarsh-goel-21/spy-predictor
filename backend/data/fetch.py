@@ -4,22 +4,14 @@ import time
 from pathlib import Path
 
 import pandas as pd
-import requests
 import yfinance as yf
-from dotenv import load_dotenv
+from backend.data.alphavantage import alphavantage_get_json, load_alphavantage_api_key
 
 RAW_DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "raw"
 RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
-ROOT_DIR = Path(__file__).resolve().parents[2]
-ALPHAVANTAGE_URL = "https://www.alphavantage.co/query"
 ALPHAVANTAGE_CACHE_TTL_SECONDS = 300
 LATEST_SOURCE_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
 PERIOD_PATTERN = re.compile(r"^(?P<value>\d+)(?P<unit>d|mo|y)$")
-
-
-def load_alphavantage_api_key() -> str | None:
-    load_dotenv(ROOT_DIR / ".env")
-    return os.getenv("ALPHAVANTAGE_API_KEY")
 
 
 def trim_df_to_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
@@ -72,9 +64,7 @@ def fetch_spy_from_alphavantage(period: str = "1y") -> pd.DataFrame:
         "outputsize": "compact",
         "apikey": api_key,
     }
-    response = requests.get(ALPHAVANTAGE_URL, params=params, timeout=30)
-    response.raise_for_status()
-    data = response.json()
+    data = alphavantage_get_json(params=params, timeout=30)
 
     if "Error Message" in data:
         raise ValueError(f"Alpha Vantage error: {data['Error Message']}")

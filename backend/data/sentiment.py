@@ -3,18 +3,10 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import requests
-from dotenv import load_dotenv
+from backend.data.alphavantage import alphavantage_get_json, load_alphavantage_api_key
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
-ALPHAVANTAGE_URL = "https://www.alphavantage.co/query"
 NEWS_CACHE_TTL_SECONDS = 300
 NEWS_CACHE: dict[str, tuple[float, list[dict]]] = {}
-
-
-def load_alphavantage_api_key() -> str | None:
-    load_dotenv(ROOT_DIR / ".env")
-    return os.getenv("ALPHAVANTAGE_API_KEY")
 
 
 def fetch_recent_spy_feed(limit: int = 50, days_back: int = 7) -> list[dict] | None:
@@ -35,10 +27,7 @@ def fetch_recent_spy_feed(limit: int = 50, days_back: int = 7) -> list[dict] | N
         "limit": limit,
         "apikey": api_key,
     }
-
-    response = requests.get(ALPHAVANTAGE_URL, params=params, timeout=30)
-    response.raise_for_status()
-    data = response.json()
+    data = alphavantage_get_json(params=params, timeout=30)
 
     if "Error Message" in data or "Information" in data or "Note" in data:
         return None
