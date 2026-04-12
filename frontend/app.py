@@ -1,4 +1,6 @@
 import os
+import threading
+import time
 
 import streamlit as st
 import requests
@@ -6,18 +8,35 @@ import plotly.graph_objects as go
 import pandas as pd
 from datetime import datetime
 
-from keepalive import start_keepalive_thread
-
 API_URL = os.getenv("API_URL", "http://localhost:8000").rstrip("/")
 
 
 @st.cache_resource
-def ensure_keepalive_started():
-    start_keepalive_thread("frontend")
+def ensure_self_ping_started():
+    enabled = os.getenv("SELF_PING_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+    target_url = os.getenv("SELF_PING_URL", "").strip()
+    interval_seconds = int(os.getenv("SELF_PING_INTERVAL_SECONDS", "600"))
+    timeout_seconds = int(os.getenv("SELF_PING_TIMEOUT_SECONDS", "30"))
+
+    if not enabled or not target_url:
+        return False
+
+    def ping_loop():
+        session = requests.Session()
+        while True:
+            try:
+                response = session.get(target_url, timeout=timeout_seconds)
+                response.raise_for_status()
+            except Exception:
+                pass
+            time.sleep(interval_seconds)
+
+    thread = threading.Thread(target=ping_loop, daemon=True)
+    thread.start()
     return True
 
 
-ensure_keepalive_started()
+ensure_self_ping_started()
 
 st.set_page_config(
     page_title="SPY · Predictor",

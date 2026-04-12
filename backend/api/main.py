@@ -1,9 +1,14 @@
+import logging
+import os
+import threading
+import time as time_module
 from datetime import datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import joblib
 import pandas as pd
+import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -11,12 +16,12 @@ from backend.api.predict import predict_next_day
 from backend.data.fetch import fetch_spy_data
 from backend.data.sentiment import fetch_spy_sentiment
 from backend.features.engineer import build_features, build_features_for_inference
-from keepalive import start_keepalive_thread
 
 MODELS_DIR = Path(__file__).resolve().parents[1] / "models"
 PROCESSED_DATA_PATH = Path(__file__).resolve().parents[2] / "data" / "processed" / "spy_features.csv"
 MARKET_TZ = ZoneInfo("America/New_York")
 MARKET_CLOSE = time(hour=16, minute=0)
+LOGGER = logging.getLogger(__name__)
 
 app = FastAPI(title="SPY Direction Predictor API")
 
@@ -29,8 +34,28 @@ app.add_middleware(
 
 
 @app.on_event("startup")
-def startup_keepalive():
-    start_keepalive_thread("backend")
+def startup_self_ping():
+    enabled = os.getenv("SELF_PING_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+    target_url = os.getenv("SELF_PING_URL", "").strip()
+    interval_seconds = int(os.getenv("SELF_PING_INTERVAL_SECONDS", "600"))
+    timeout_seconds = int(os.getenv("SELF_PING_TIMEOUT_SECONDS", "30"))
+
+    if not enabled or not target_url:
+        return
+
+    def ping_loop():
+        session = requests.Session()
+        while True:
+            try:
+                response = session.get(target_url, timeout=timeout_seconds)
+                response.raise_for_status()
+            except Exception as exc:
+                LOGGER.warning("backend self-ping failed for %s: %s", target_url, exc)
+            time_module.sleep(interval_seconds)
+
+    thread = threading.Thread(target=ping_loop, daemon=True)
+    thread.start()
+    LOGGER.info("backend self-ping enabled: %s every %ss", target_url, interval_seconds)
 
 
 def keep_completed_daily_bars(raw: pd.DataFrame) -> pd.DataFrame:
