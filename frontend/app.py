@@ -6,7 +6,18 @@ import plotly.graph_objects as go
 import pandas as pd
 from datetime import datetime
 
+from keepalive import start_keepalive_thread
+
 API_URL = os.getenv("API_URL", "http://localhost:8000").rstrip("/")
+
+
+@st.cache_resource
+def ensure_keepalive_started():
+    start_keepalive_thread("frontend")
+    return True
+
+
+ensure_keepalive_started()
 
 st.set_page_config(
     page_title="SPY · Predictor",

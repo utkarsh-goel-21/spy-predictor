@@ -11,6 +11,7 @@ from backend.api.predict import predict_next_day
 from backend.data.fetch import fetch_spy_data
 from backend.data.sentiment import fetch_spy_sentiment
 from backend.features.engineer import build_features, build_features_for_inference
+from keepalive import start_keepalive_thread
 
 MODELS_DIR = Path(__file__).resolve().parents[1] / "models"
 PROCESSED_DATA_PATH = Path(__file__).resolve().parents[2] / "data" / "processed" / "spy_features.csv"
@@ -25,6 +26,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def startup_keepalive():
+    start_keepalive_thread("backend")
 
 
 def keep_completed_daily_bars(raw: pd.DataFrame) -> pd.DataFrame:
