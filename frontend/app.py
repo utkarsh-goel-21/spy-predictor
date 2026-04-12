@@ -10,22 +10,24 @@ import pandas as pd
 
 API_URL = os.getenv("API_URL", "http://localhost:8000").rstrip("/")
 SELF_PING_URL = "https://spy-predictor-ui.onrender.com"
+SELF_PING_INTERVAL_SECONDS = 600
 
 
 @st.cache_resource
 def ensure_self_ping_started():
     def ping_loop():
-        session = requests.Session()
         while True:
-            time.sleep(600)
+            time.sleep(SELF_PING_INTERVAL_SECONDS)
             try:
-                response = session.get(SELF_PING_URL, timeout=30)
+                response = requests.get(SELF_PING_URL, timeout=30)
                 response.raise_for_status()
-            except Exception:
-                pass
+                print(f"frontend self-ping ok: {SELF_PING_URL}", flush=True)
+            except Exception as exc:
+                print(f"frontend self-ping failed for {SELF_PING_URL}: {exc}", flush=True)
 
     thread = threading.Thread(target=ping_loop, daemon=True)
     thread.start()
+    print(f"frontend self-ping enabled: {SELF_PING_URL} every {SELF_PING_INTERVAL_SECONDS}s", flush=True)
     return True
 
 
@@ -709,7 +711,7 @@ if run:
         )
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     st.markdown("<hr class='row-divider'>", unsafe_allow_html=True)
 

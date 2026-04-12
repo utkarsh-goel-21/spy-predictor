@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 import joblib
 import pandas as pd
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.api.predict import predict_next_day
@@ -22,6 +22,7 @@ MARKET_TZ = ZoneInfo("America/New_York")
 MARKET_CLOSE = time(hour=16, minute=0)
 LOGGER = logging.getLogger(__name__)
 SELF_PING_URL = "https://spy-predictor-api.onrender.com/health"
+SELF_PING_INTERVAL_SECONDS = 600
 DASHBOARD_CACHE_TTL_SECONDS = 300
 LIVE_DASHBOARD_CACHE: dict[str, tuple[float, dict]] = {}
 
@@ -38,18 +39,18 @@ app.add_middleware(
 @app.on_event("startup")
 def startup_self_ping():
     def ping_loop():
-        session = requests.Session()
         while True:
-            time_module.sleep(600)
+            time_module.sleep(SELF_PING_INTERVAL_SECONDS)
             try:
-                response = session.get(SELF_PING_URL, timeout=30)
+                response = requests.get(SELF_PING_URL, timeout=30)
                 response.raise_for_status()
+                LOGGER.info("backend self-ping ok: %s", SELF_PING_URL)
             except Exception as exc:
                 LOGGER.warning("backend self-ping failed for %s: %s", SELF_PING_URL, exc)
 
     thread = threading.Thread(target=ping_loop, daemon=True)
     thread.start()
-    LOGGER.info("backend self-ping enabled: %s every 600s", SELF_PING_URL)
+    LOGGER.info("backend self-ping enabled: %s every %ss", SELF_PING_URL, SELF_PING_INTERVAL_SECONDS)
 
 
 def keep_completed_daily_bars(raw: pd.DataFrame) -> pd.DataFrame:
@@ -88,9 +89,19 @@ def health():
     return {"status": "ok"}
 
 
+@app.head("/health")
+def health_head():
+    return Response(status_code=200)
+
+
 @app.get("/")
 def root():
     return {"status": "ok", "service": "spy-predictor-api", "docs": "/docs"}
+
+
+@app.head("/")
+def root_head():
+    return Response(status_code=200)
 
 
 def build_prediction_payload(raw: pd.DataFrame, df: pd.DataFrame) -> dict:
