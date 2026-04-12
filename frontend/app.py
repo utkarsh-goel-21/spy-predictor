@@ -1,35 +1,28 @@
 import os
 import threading
 import time
+from datetime import datetime
 
 import streamlit as st
 import requests
 import plotly.graph_objects as go
 import pandas as pd
-from datetime import datetime
 
 API_URL = os.getenv("API_URL", "http://localhost:8000").rstrip("/")
+SELF_PING_URL = "https://spy-predictor-ui.onrender.com"
 
 
 @st.cache_resource
 def ensure_self_ping_started():
-    enabled = os.getenv("SELF_PING_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
-    target_url = os.getenv("SELF_PING_URL", "").strip()
-    interval_seconds = int(os.getenv("SELF_PING_INTERVAL_SECONDS", "600"))
-    timeout_seconds = int(os.getenv("SELF_PING_TIMEOUT_SECONDS", "30"))
-
-    if not enabled or not target_url:
-        return False
-
     def ping_loop():
         session = requests.Session()
         while True:
+            time.sleep(600)
             try:
-                response = session.get(target_url, timeout=timeout_seconds)
+                response = session.get(SELF_PING_URL, timeout=30)
                 response.raise_for_status()
             except Exception:
                 pass
-            time.sleep(interval_seconds)
 
     thread = threading.Thread(target=ping_loop, daemon=True)
     thread.start()

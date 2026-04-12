@@ -1,5 +1,4 @@
 import logging
-import os
 import threading
 import time as time_module
 from datetime import datetime, time
@@ -22,6 +21,7 @@ PROCESSED_DATA_PATH = Path(__file__).resolve().parents[2] / "data" / "processed"
 MARKET_TZ = ZoneInfo("America/New_York")
 MARKET_CLOSE = time(hour=16, minute=0)
 LOGGER = logging.getLogger(__name__)
+SELF_PING_URL = "https://spy-predictor-api.onrender.com/health"
 
 app = FastAPI(title="SPY Direction Predictor API")
 
@@ -35,27 +35,19 @@ app.add_middleware(
 
 @app.on_event("startup")
 def startup_self_ping():
-    enabled = os.getenv("SELF_PING_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
-    target_url = os.getenv("SELF_PING_URL", "").strip()
-    interval_seconds = int(os.getenv("SELF_PING_INTERVAL_SECONDS", "600"))
-    timeout_seconds = int(os.getenv("SELF_PING_TIMEOUT_SECONDS", "30"))
-
-    if not enabled or not target_url:
-        return
-
     def ping_loop():
         session = requests.Session()
         while True:
+            time_module.sleep(600)
             try:
-                response = session.get(target_url, timeout=timeout_seconds)
+                response = session.get(SELF_PING_URL, timeout=30)
                 response.raise_for_status()
             except Exception as exc:
-                LOGGER.warning("backend self-ping failed for %s: %s", target_url, exc)
-            time_module.sleep(interval_seconds)
+                LOGGER.warning("backend self-ping failed for %s: %s", SELF_PING_URL, exc)
 
     thread = threading.Thread(target=ping_loop, daemon=True)
     thread.start()
-    LOGGER.info("backend self-ping enabled: %s every %ss", target_url, interval_seconds)
+    LOGGER.info("backend self-ping enabled: %s every 600s", SELF_PING_URL)
 
 
 def keep_completed_daily_bars(raw: pd.DataFrame) -> pd.DataFrame:
