@@ -22,6 +22,8 @@ MARKET_TZ = ZoneInfo("America/New_York")
 MARKET_CLOSE = time(hour=16, minute=0)
 LOGGER = logging.getLogger(__name__)
 SELF_PING_URL = "https://spy-predictor-api.onrender.com/health"
+DASHBOARD_CACHE_TTL_SECONDS = 300
+LIVE_DASHBOARD_CACHE: dict[str, tuple[float, dict]] = {}
 
 app = FastAPI(title="SPY Direction Predictor API")
 
@@ -86,70 +88,152 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "spy-predictor-api", "docs": "/docs"}
+
+
+def build_prediction_payload(raw: pd.DataFrame, df: pd.DataFrame) -> dict:
+    result = predict_next_day(df)
+    latest_missing_external = df.attrs.get("latest_missing_external", [])
+
+    raw_last_date = pd.Timestamp(raw.index[-1]).tz_localize(None)
+    last_date = pd.Timestamp(df.index[-1])
+    next_trading_day = next_trading_day_for(last_date)
+    expected_last_date = expected_latest_completed_bar_date()
+
+    result["market_data_source"] = raw.attrs.get("source", "unknown")
+    result["market_data_last_refreshed"] = raw.attrs.get("last_refreshed")
+    result["raw_data_last_date"] = str(raw_last_date.date())
+    result["as_of_date"] = str(last_date.date())
+    result["predicting_for"] = str(next_trading_day.date())
+    result["expected_latest_bar_date"] = str(expected_last_date.date())
+
+    if last_date < raw_last_date:
+        result["market_data_status"] = "feature_lag"
+        result["market_data_warning"] = (
+            f"SPY data is available through {raw_last_date.date()}, but one or more external features "
+            f"are only available through {last_date.date()}."
+        )
+    elif latest_missing_external:
+        result["market_data_status"] = "feature_lag_filled"
+        result["market_data_warning"] = (
+            f"SPY data is available through {raw_last_date.date()}, but "
+            f"{', '.join(latest_missing_external)} were carried forward from the last available day."
+        )
+    elif raw_last_date < expected_last_date:
+        result["market_data_status"] = "source_lag"
+        result["market_data_warning"] = (
+            f"{result['market_data_source']} daily data is currently available only through {raw_last_date.date()}, "
+            f"so the latest prediction is for {next_trading_day.date()}."
+        )
+    else:
+        result["market_data_status"] = "current"
+        result["market_data_warning"] = None
+
+    sentiment = fetch_spy_sentiment(last_date.to_pydatetime().replace(tzinfo=None))
+    result["sentiment"] = sentiment
+
+    lstm_up = result["prediction"] == 1
+    sent_score = sentiment["sentiment_score"]
+
+    if lstm_up and sent_score >= 0.15:
+        signal = "Strong UP"
+    elif lstm_up and sent_score <= -0.15:
+        signal = "Weak UP — sentiment disagrees"
+    elif not lstm_up and sent_score <= -0.15:
+        signal = "Strong DOWN"
+    elif not lstm_up and sent_score >= 0.15:
+        signal = "Weak DOWN — sentiment disagrees"
+    else:
+        signal = "Uncertain — sentiment neutral"
+
+    result["combined_signal"] = signal
+    return result
+
+
+def build_model_info_payload() -> dict:
+    feature_cols = joblib.load(MODELS_DIR / "lstm_feature_cols.pkl")
+    config = joblib.load(MODELS_DIR / "lstm_config.pkl")
+    return {
+        "model": "LSTM",
+        "sequence_length": config.get("sequence_length", 10),
+        "features": feature_cols,
+        "num_features": config["input_size"],
+        "cv_accuracy": config.get("cv_accuracy", 0.5209),
+    }
+
+
+def build_chart_payload(raw: pd.DataFrame) -> dict:
+    df = raw[["Close"]].copy()
+    df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
+    cutoff = pd.Timestamp(df.index.max()) - pd.DateOffset(months=3)
+    df = df[df.index >= cutoff]
+    records = [
+        {"date": str(idx.date()), "close": round(float(row["Close"]), 2)}
+        for idx, row in df.iterrows()
+    ]
+    return {
+        "data": records,
+        "source": raw.attrs.get("source", "unknown"),
+        "last_refreshed": raw.attrs.get("last_refreshed"),
+    }
+
+
+def build_news_payload() -> dict:
+    from backend.data.sentiment import fetch_recent_spy_feed
+
+    feed = fetch_recent_spy_feed(limit=10, days_back=7) or []
+    articles = []
+    for article in feed:
+        spy_sentiment = next(
+            (t for t in article.get("ticker_sentiment", []) if t["ticker"] == "SPY"),
+            None
+        )
+        articles.append({
+            "title": article.get("title", ""),
+            "summary": article.get("summary", "")[:200] + "...",
+            "source": article.get("source", ""),
+            "url": article.get("url", ""),
+            "time_published": article.get("time_published", ""),
+            "sentiment_label": spy_sentiment["ticker_sentiment_label"] if spy_sentiment else "Neutral",
+            "sentiment_score": float(spy_sentiment["ticker_sentiment_score"]) if spy_sentiment else 0.0,
+        })
+    return {"articles": articles}
+
+
+def build_live_dashboard_payload() -> dict:
+    cache_key = "live_dashboard"
+    cached = LIVE_DASHBOARD_CACHE.get(cache_key)
+    if cached and time_module.time() - cached[0] < DASHBOARD_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    raw = fetch_spy_data(period="1y", source_preference="latest")
+    raw = keep_completed_daily_bars(raw)
+    df = build_features_for_inference(raw, period="1y")
+
+    payload = {
+        "prediction": build_prediction_payload(raw, df),
+        "chart": build_chart_payload(raw),
+        "news": build_news_payload(),
+        "model_info": build_model_info_payload(),
+    }
+    LIVE_DASHBOARD_CACHE[cache_key] = (time_module.time(), payload)
+    return payload
+
+
+@app.get("/dashboard")
+def dashboard():
+    try:
+        return build_live_dashboard_payload()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/predict")
 def predict():
     try:
-        raw = fetch_spy_data(period="1y", source_preference="latest")
-        raw = keep_completed_daily_bars(raw)
-        df = build_features_for_inference(raw, period="1y")
-        result = predict_next_day(df)
-        latest_missing_external = df.attrs.get("latest_missing_external", [])
-
-        # Use the last available data point as reference
-        raw_last_date = pd.Timestamp(raw.index[-1]).tz_localize(None)
-        last_date = pd.Timestamp(df.index[-1])
-        next_trading_day = next_trading_day_for(last_date)
-        expected_last_date = expected_latest_completed_bar_date()
-
-        result["market_data_source"] = raw.attrs.get("source", "unknown")
-        result["market_data_last_refreshed"] = raw.attrs.get("last_refreshed")
-        result["raw_data_last_date"] = str(raw_last_date.date())
-        result["as_of_date"] = str(last_date.date())
-        result["predicting_for"] = str(next_trading_day.date())
-        result["expected_latest_bar_date"] = str(expected_last_date.date())
-
-        if last_date < raw_last_date:
-            result["market_data_status"] = "feature_lag"
-            result["market_data_warning"] = (
-                f"SPY data is available through {raw_last_date.date()}, but one or more external features "
-                f"are only available through {last_date.date()}."
-            )
-        elif latest_missing_external:
-            result["market_data_status"] = "feature_lag_filled"
-            result["market_data_warning"] = (
-                f"SPY data is available through {raw_last_date.date()}, but "
-                f"{', '.join(latest_missing_external)} were carried forward from the last available day."
-            )
-        elif raw_last_date < expected_last_date:
-            result["market_data_status"] = "source_lag"
-            result["market_data_warning"] = (
-                f"{result['market_data_source']} daily data is currently available only through {raw_last_date.date()}, "
-                f"so the latest prediction is for {next_trading_day.date()}."
-            )
-        else:
-            result["market_data_status"] = "current"
-            result["market_data_warning"] = None
-
-        sentiment = fetch_spy_sentiment(last_date.to_pydatetime().replace(tzinfo=None))
-        result["sentiment"] = sentiment
-
-        lstm_up = result["prediction"] == 1
-        sent_score = sentiment["sentiment_score"]
-
-        if lstm_up and sent_score >= 0.15:
-            signal = "Strong UP"
-        elif lstm_up and sent_score <= -0.15:
-            signal = "Weak UP — sentiment disagrees"
-        elif not lstm_up and sent_score <= -0.15:
-            signal = "Strong DOWN"
-        elif not lstm_up and sent_score >= 0.15:
-            signal = "Weak DOWN — sentiment disagrees"
-        else:
-            signal = "Uncertain — sentiment neutral"
-
-        result["combined_signal"] = signal
-
-        return result
+        return build_live_dashboard_payload()["prediction"]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -157,15 +241,7 @@ def predict():
 @app.get("/model-info")
 def model_info():
     try:
-        feature_cols = joblib.load(MODELS_DIR / "lstm_feature_cols.pkl")
-        config = joblib.load(MODELS_DIR / "lstm_config.pkl")
-        return {
-            "model": "LSTM",
-            "sequence_length": config.get("sequence_length", 10),
-            "features": feature_cols,
-            "num_features": config["input_size"],
-            "cv_accuracy": config.get("cv_accuracy", 0.5209),
-        }
+        return build_model_info_payload()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -173,19 +249,7 @@ def model_info():
 @app.get("/chart-data")
 def chart_data():
     try:
-        import pandas as pd
-        raw = fetch_spy_data(period="3mo", source_preference="latest")
-        df = raw[["Close"]].copy()
-        df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
-        records = [
-            {"date": str(idx.date()), "close": round(float(row["Close"]), 2)}
-            for idx, row in df.iterrows()
-        ]
-        return {
-            "data": records,
-            "source": raw.attrs.get("source", "unknown"),
-            "last_refreshed": raw.attrs.get("last_refreshed"),
-        }
+        return build_live_dashboard_payload()["chart"]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -193,27 +257,7 @@ def chart_data():
 @app.get("/news")
 def news():
     try:
-        from backend.data.sentiment import fetch_recent_spy_feed
-
-        feed = fetch_recent_spy_feed(limit=10, days_back=7) or []
-
-        articles = []
-        for article in feed:
-            spy_sentiment = next(
-                (t for t in article.get("ticker_sentiment", []) if t["ticker"] == "SPY"),
-                None
-            )
-            articles.append({
-                "title": article.get("title", ""),
-                "summary": article.get("summary", "")[:200] + "...",
-                "source": article.get("source", ""),
-                "url": article.get("url", ""),
-                "time_published": article.get("time_published", ""),
-                "sentiment_label": spy_sentiment["ticker_sentiment_label"] if spy_sentiment else "Neutral",
-                "sentiment_score": float(spy_sentiment["ticker_sentiment_score"]) if spy_sentiment else 0.0,
-            })
-
-        return {"articles": articles}
+        return build_live_dashboard_payload()["news"]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

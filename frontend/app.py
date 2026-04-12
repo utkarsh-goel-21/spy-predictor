@@ -546,10 +546,11 @@ if bt_run:
 if run:
     with st.spinner("Fetching live data..."):
         try:
-            pred = requests.get(f"{API_URL}/predict", timeout=60).json()
-            chart = requests.get(f"{API_URL}/chart-data", timeout=30).json()
-            news = requests.get(f"{API_URL}/news", timeout=30).json()
-            info = requests.get(f"{API_URL}/model-info", timeout=10).json()
+            dashboard = requests.get(f"{API_URL}/dashboard", timeout=90).json()
+            pred = dashboard["prediction"]
+            chart = dashboard["chart"]
+            news = dashboard["news"]
+            info = dashboard["model_info"]
         except Exception as e:
             st.error(f"API connection failed: {e}")
             st.stop()
