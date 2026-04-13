@@ -1,7 +1,7 @@
 import logging
 import threading
 import time as time_module
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -19,12 +19,14 @@ from backend.features.engineer import build_features, build_features_for_inferen
 MODELS_DIR = Path(__file__).resolve().parents[1] / "models"
 PROCESSED_DATA_PATH = Path(__file__).resolve().parents[2] / "data" / "processed" / "spy_features.csv"
 MARKET_TZ = ZoneInfo("America/New_York")
+MARKET_OPEN = time(hour=9, minute=30)
 MARKET_CLOSE = time(hour=16, minute=0)
 LOGGER = logging.getLogger(__name__)
 SELF_PING_URL = "https://spy-predictor-api.onrender.com/health"
 SELF_PING_INTERVAL_SECONDS = 600
 DASHBOARD_CACHE_TTL_SECONDS = 300
 LIVE_DASHBOARD_CACHE: dict[str, tuple[float, dict]] = {}
+SESSION_REGIME_CACHE: dict[str, tuple[float, dict]] = {}
 
 app = FastAPI(title="SPY Direction Predictor API")
 
@@ -69,6 +71,36 @@ def keep_completed_daily_bars(raw: pd.DataFrame) -> pd.DataFrame:
 
 def next_trading_day_for(last_date: pd.Timestamp) -> pd.Timestamp:
     return pd.Timestamp(last_date) + pd.offsets.BDay(1)
+
+
+def previous_trading_day_for(day: pd.Timestamp | datetime) -> pd.Timestamp:
+    return pd.Timestamp(day).normalize() - pd.offsets.BDay(1)
+
+
+def active_session_date_for(now_market: datetime | None = None) -> pd.Timestamp:
+    now_market = now_market or datetime.now(MARKET_TZ)
+    market_day = pd.Timestamp(now_market.date())
+
+    if now_market.weekday() >= 5:
+        return previous_trading_day_for(market_day)
+
+    if now_market.time() < MARKET_OPEN:
+        return previous_trading_day_for(market_day)
+
+    return market_day
+
+
+def session_open_datetime_for(session_date: pd.Timestamp) -> datetime:
+    return datetime.combine(
+        pd.Timestamp(session_date).date(),
+        MARKET_OPEN,
+        tzinfo=MARKET_TZ,
+    )
+
+
+def next_session_open_datetime_for(session_date: pd.Timestamp) -> datetime:
+    next_session_date = next_trading_day_for(pd.Timestamp(session_date))
+    return session_open_datetime_for(next_session_date)
 
 
 def expected_latest_completed_bar_date(now_market: datetime | None = None) -> pd.Timestamp:
@@ -163,6 +195,64 @@ def build_prediction_payload(raw: pd.DataFrame, df: pd.DataFrame) -> dict:
     return result
 
 
+def build_active_session_regime_payload(
+    raw: pd.DataFrame,
+    df: pd.DataFrame,
+    now_market: datetime | None = None,
+) -> dict:
+    now_market = now_market or datetime.now(MARKET_TZ)
+    active_session_date = active_session_date_for(now_market)
+    source_session_date = previous_trading_day_for(active_session_date)
+
+    session_df = df[df.index <= source_session_date].copy()
+    if session_df.empty:
+        raise HTTPException(
+            status_code=503,
+            detail=f"No SPY feature history available to build the active session regime for {active_session_date.date()}.",
+        )
+
+    session_last_date = pd.Timestamp(session_df.index[-1]).normalize()
+    if session_last_date != source_session_date:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Active session regime for {active_session_date.date()} is not ready. "
+                f"Expected features through {source_session_date.date()}, got {session_last_date.date()}."
+            ),
+        )
+
+    result = predict_next_day(session_df)
+    raw_last_date = pd.Timestamp(raw.index[-1]).tz_localize(None)
+    latest_feature_date = pd.Timestamp(df.index[-1]).normalize()
+    latest_predicting_for = next_trading_day_for(latest_feature_date)
+    next_session_open = next_session_open_datetime_for(active_session_date)
+
+    result["market_data_source"] = raw.attrs.get("source", "unknown")
+    result["market_data_last_refreshed"] = raw.attrs.get("last_refreshed")
+    result["raw_data_last_date"] = str(raw_last_date.date())
+    result["as_of_date"] = str(source_session_date.date())
+    result["predicting_for"] = str(active_session_date.date())
+    result["active_session_date"] = str(active_session_date.date())
+    result["latest_available_as_of_date"] = str(latest_feature_date.date())
+    result["latest_available_predicting_for"] = str(latest_predicting_for.date())
+    result["effective_from_ny"] = session_open_datetime_for(active_session_date).isoformat()
+    result["effective_until_ny"] = next_session_open.isoformat()
+    result["effective_until_utc"] = next_session_open.astimezone(timezone.utc).isoformat()
+    result["session_mode"] = "active"
+
+    if raw_last_date < source_session_date:
+        result["market_data_status"] = "source_lag"
+        result["market_data_warning"] = (
+            f"{result['market_data_source']} daily data is currently available only through {raw_last_date.date()}, "
+            f"so the active session regime for {active_session_date.date()} may still be stale."
+        )
+    else:
+        result["market_data_status"] = "session_locked"
+        result["market_data_warning"] = None
+
+    return result
+
+
 def build_model_info_payload() -> dict:
     feature_cols = joblib.load(MODELS_DIR / "lstm_feature_cols.pkl")
     config = joblib.load(MODELS_DIR / "lstm_config.pkl")
@@ -233,6 +323,20 @@ def build_live_dashboard_payload() -> dict:
     return payload
 
 
+def build_session_regime_payload() -> dict:
+    cache_key = "active_session_regime"
+    cached = SESSION_REGIME_CACHE.get(cache_key)
+    if cached and time_module.time() - cached[0] < DASHBOARD_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    raw = fetch_spy_data(period="1y", source_preference="latest")
+    raw = keep_completed_daily_bars(raw)
+    df = build_features_for_inference(raw, period="1y")
+    payload = build_active_session_regime_payload(raw, df)
+    SESSION_REGIME_CACHE[cache_key] = (time_module.time(), payload)
+    return payload
+
+
 @app.get("/dashboard")
 def dashboard():
     try:
@@ -245,6 +349,14 @@ def dashboard():
 def predict():
     try:
         return build_live_dashboard_payload()["prediction"]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/session-regime")
+def session_regime():
+    try:
+        return build_session_regime_payload()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
