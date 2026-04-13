@@ -56,7 +56,7 @@ def trim_df_to_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
 
 def expected_latest_daily_bar_date(now: pd.Timestamp | None = None) -> pd.Timestamp:
     ny_now = (now or pd.Timestamp.now(tz=ZoneInfo("America/New_York"))).tz_convert(ZoneInfo("America/New_York"))
-    session_date = ny_now.normalize()
+    session_date = ny_now.normalize().tz_localize(None)
 
     if ny_now.weekday() >= 5:
         return (session_date - pd.offsets.BDay(1)).normalize()
