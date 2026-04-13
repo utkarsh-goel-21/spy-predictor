@@ -169,7 +169,11 @@ Create a `.env` file in the root directory:
 
 ```env
 ALPHAVANTAGE_API_KEY=your_api_key_here
+TWELVE_DATA_API_KEY=your_api_key_here
+FMP_API_KEY=your_api_key_here
 ```
+
+For the live daily `SPY` bar, the backend now tries `Alpha Vantage -> Twelve Data -> FMP -> Yahoo Finance` and keeps moving down the chain if an earlier provider is unavailable or stale.
 
 #### 5. Run the backend server
 
